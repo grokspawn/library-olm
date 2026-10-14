@@ -70,6 +70,9 @@ func selectedCommandOutput() commandOutput {
 			} else {
 				printCheckResults(result.FailedChecks)
 			}
+			for _, warning := range result.Warnings {
+				warn(warning)
+			}
 			return nil
 		},
 		dryRunPreview: printDryRunPreview,
@@ -145,10 +148,7 @@ func selectedCommandOutput() commandOutput {
 		}
 		output.dryRunStart = func(string) {}
 		output.dryRunChecks = func(target string, result migration.OperatorScanResult) error {
-			if result.Status != migration.OperatorStatusEligible {
-				return formatter.WriteRecord(os.Stdout, outputRecord{Type: "check", Command: "convert", Target: target, Data: scanResultData(result)})
-			}
-			return nil
+			return formatter.WriteRecord(os.Stdout, outputRecord{Type: "check", Command: "convert", Target: target, Data: scanResultData(result)})
 		}
 		output.dryRunPreview = func(opts, resourceOpts migration.Options, info *migration.MigrationInfo) error {
 			return formatter.WriteRecord(os.Stdout, dryRunRecord(opts, resourceOpts, info))

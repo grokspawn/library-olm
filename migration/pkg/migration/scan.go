@@ -173,8 +173,7 @@ func (m *Migrator) ScanAllSubscriptionsWithOptions(ctx context.Context, defaults
 				result.Eligible = true
 				// R9: warn if other installed operators declare a dependency on this package.
 				if dependents := m.findDependents(ctx, sub.Spec.Package); len(dependents) > 0 {
-					result.Warnings = append(result.Warnings,
-						fmt.Sprintf("other operator(s) may depend on package %q: %v — verify they remain functional after migration", sub.Spec.Package, dependents))
+					result.Warnings = append(result.Warnings, dependentsWarning(sub.Spec.Package, dependents))
 				}
 			}
 		} else {
@@ -294,8 +293,7 @@ func (m *Migrator) ScanSubscription(ctx context.Context, opts Options) (*Operato
 	result.Eligible = true
 	// R9: warn if other installed operators declare a dependency on this package.
 	if dependents := m.findDependents(ctx, result.PackageName); len(dependents) > 0 {
-		result.Warnings = append(result.Warnings,
-			fmt.Sprintf("other operator(s) may depend on package %q: %v — verify they remain functional after migration", result.PackageName, dependents))
+		result.Warnings = append(result.Warnings, dependentsWarning(result.PackageName, dependents))
 	}
 	return result, nil
 }
@@ -337,6 +335,9 @@ func PrintScanSummary(results []OperatorScanResult, printf func(string, ...inter
 				printf("  ✓ %s (already migrated)\n", r.State)
 			case OperatorStatusEligible:
 				printf("  ✓ %s/%s (%s)\n", r.SubscriptionNamespace, r.SubscriptionName, r.PackageName)
+			}
+			for _, warning := range r.Warnings {
+				printf("      ⚠️  %s\n", warning)
 			}
 		}
 	}
@@ -660,6 +661,10 @@ func (m *Migrator) findDependents(ctx context.Context, packageName string) []str
 		}
 	}
 	return dependents
+}
+
+func dependentsWarning(packageName string, dependents []string) string {
+	return fmt.Sprintf("other operator(s) may depend on package %q: %v — verify they remain functional after migration", packageName, dependents)
 }
 
 // Gather checks the target COS prerequisites and collects everything that would

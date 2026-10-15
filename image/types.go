@@ -253,7 +253,7 @@ func (s *CachingRepository) cacheFile(path string, reader io.Reader) error {
 		return errors.Join(err, f.Cleanup())
 	}
 	if err := f.CloseAtomicallyReplace(); err != nil {
-		return err
+		return errors.Join(err, f.Cleanup())
 	}
 	return nil
 }
@@ -287,5 +287,8 @@ type Handler interface {
 
 	// Unpack extracts the image content into dest. Returns an error if
 	// unpacking fails (e.g. blob fetch failure, corrupt layer, I/O error).
+	// Unpack is _not_ expected to implement semantic validation. It's sole
+	// job is to faithfully manifest the OCI content into a filesystem
+	// representation.
 	Unpack(ctx context.Context, repo Repository, desc ocispecv1.Descriptor, manifestBytes []byte, dest string) error
 }

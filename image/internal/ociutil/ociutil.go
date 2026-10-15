@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
 	"github.com/containerd/containerd/archive"
+	"github.com/google/renameio/v2"
 	ocispecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"go.podman.io/image/v5/pkg/compression"
 
@@ -45,6 +47,17 @@ func DiscoverManifestDescriptors(ctx context.Context, repo image.Repository, des
 	return descs, nil
 }
 
+// FindFirstLayer returns the first layer descriptor with the given media type.
+// If no layer with the given media type is found, FindFirstLayer returns nil.
+func FindFirstLayer(layers []ocispecv1.Descriptor, mediaType string) *ocispecv1.Descriptor {
+	for _, l := range layers {
+		if l.MediaType == mediaType {
+			return &l
+		}
+	}
+	return nil
+}
+
 // LayerFilter inspects or modifies a [tar.Header] during layer extraction.
 // Return true to keep the entry, false to skip it. Filters may also mutate
 // the header (e.g. to rewrite paths or change ownership). See [CombineFilters],
@@ -69,6 +82,9 @@ func ApplyLayers(ctx context.Context, repo image.Repository, manifestBytes []byt
 	return nil
 }
 
+// applyLayer fetches and decompresses one image layer, then applies its tar
+// entries to dest using filter. It closes the blob and decompressed readers,
+// joining any close errors with the extraction error.
 func applyLayer(ctx context.Context, repo image.Repository, dest string, layer ocispecv1.Descriptor, filter LayerFilter) error {
 	reader, err := repo.FetchBlob(ctx, layer)
 	if err != nil {
@@ -186,4 +202,21 @@ func AsCurrentUser() LayerFilter {
 		h.Xattrs = nil //nolint:staticcheck
 		return true, nil
 	}
+}
+
+// WriteBlobFile fetches the blob identified by desc and copies it to path using
+// a temporary file. It returns errors encountered while fetching, copying, or
+// finalizing the file, and closes the fetched blob reader.
+func WriteBlobFile(ctx context.Context, repo image.Repository, desc ocispecv1.Descriptor, path string) error {
+	reader, err := repo.FetchBlob(ctx, desc)
+	if err != nil {
+		return err
+	}
+
+	f, err := renameio.NewPendingFile(path, renameio.WithReplaceOnClose())
+	if err != nil {
+		return errors.Join(err, reader.Close())
+	}
+	_, copyErr := io.Copy(f, reader)
+	return errors.Join(copyErr, f.Close(), f.Cleanup(), reader.Close())
 }

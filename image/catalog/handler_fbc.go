@@ -11,6 +11,7 @@ import (
 
 	"github.com/operator-framework/library-olm/image"
 	"github.com/operator-framework/library-olm/image/internal/ociutil"
+	"github.com/operator-framework/library-olm/image/internal/osutil"
 )
 
 // ConfigDirLabel is the label on catalog images that specifies the directory
@@ -91,7 +92,9 @@ func (h *FBCHandler) Unpack(ctx context.Context, repo image.Repository, desc oci
 		ociutil.RewritePath(configDir, "/"),
 		ociutil.AsCurrentUser(),
 	)
-	return ociutil.ApplyLayers(ctx, repo, manifestBytes, dest, filter)
+	return osutil.DoStagedDir(dest, func(stagedDir string) error {
+		return ociutil.ApplyLayers(ctx, repo, manifestBytes, stagedDir, filter)
+	})
 }
 
 // resolvePlatformManifest selects the appropriate platform manifest from a manifest list/index.

@@ -2,9 +2,13 @@ package bundle
 
 import (
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/opencontainers/go-digest"
 	ocispecv1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -43,6 +47,26 @@ func buildSignedHelmManifest(t *testing.T, repo *testutil.FakeRepo) (ocispecv1.D
 		chartData,
 		provDesc,
 	)
+}
+
+type trackedHelmReader struct {
+	io.Reader
+	closeErr error
+	closed   bool
+}
+
+func (r *trackedHelmReader) Close() error {
+	r.closed = true
+	return r.closeErr
+}
+
+func assertNoHelmOutput(t *testing.T, root, dest string) {
+	t.Helper()
+	_, err := os.Stat(dest)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	entries, err := os.ReadDir(root)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "staging directory left behind")
 }
 
 // --- Tests ---
@@ -164,7 +188,7 @@ func TestHelmChartHandler_Unpack(t *testing.T) {
 			[]byte("fake-tgz-content"),
 		)
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &HelmChartHandler{}
 		require.NoError(t, h.Unpack(ctx, repo, desc, manifestBytes, dest))
 
@@ -223,7 +247,7 @@ func TestHelmChartHandler_Unpack(t *testing.T) {
 			provDesc,
 		)
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &HelmChartHandler{}
 		require.NoError(t, h.Unpack(ctx, repo, desc, manifestBytes, dest))
 
@@ -238,7 +262,7 @@ func TestHelmChartHandler_Unpack(t *testing.T) {
 			[]byte("chart-data"),
 		)
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &HelmChartHandler{}
 		require.NoError(t, h.Unpack(ctx, repo, desc, manifestBytes, dest))
 
@@ -249,7 +273,7 @@ func TestHelmChartHandler_Unpack(t *testing.T) {
 		repo := testutil.NewFakeRepo()
 		desc, manifestBytes := buildSignedHelmManifest(t, repo)
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &HelmChartHandler{
 			Verify:  downloader.VerifyAlways,
 			Keyring: "testdata/helm-test-key.pub",
@@ -301,7 +325,7 @@ func TestHelmChartHandler_Unpack(t *testing.T) {
 		repo := testutil.NewFakeRepo()
 		desc, manifestBytes := buildSignedHelmManifest(t, repo)
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &HelmChartHandler{
 			Verify:  downloader.VerifyIfPossible,
 			Keyring: "testdata/helm-test-key.pub",
@@ -319,7 +343,7 @@ func TestHelmChartHandler_Unpack(t *testing.T) {
 			[]byte("chart-data"),
 		)
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &HelmChartHandler{
 			Verify:  downloader.VerifyIfPossible,
 			Keyring: "testdata/helm-test-key.pub",
@@ -361,7 +385,7 @@ func TestHelmChartHandler_Unpack(t *testing.T) {
 			badProvDesc,
 		)
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &HelmChartHandler{Verify: downloader.VerifyLater}
 		require.NoError(t, h.Unpack(ctx, repo, desc, manifestBytes, dest))
 
@@ -460,5 +484,192 @@ func TestHelmChartHandler_Unpack(t *testing.T) {
 		err := h.Unpack(ctx, testutil.NewFakeRepo(), desc, []byte("not-json"), t.TempDir())
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "parsing manifest")
+	})
+}
+
+func TestHelmChartHandler_UnpackStagesBeforePublishing(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("PublishesUnvalidatedChartBytes", func(t *testing.T) {
+		repo := testutil.NewFakeRepo()
+		desc, manifestBytes := buildHelmManifest(repo,
+			`{"apiVersion":"v2","name":"mychart","version":"0.1.0"}`,
+			[]byte("not-a-chart-archive"),
+		)
+		root := t.TempDir()
+		dest := filepath.Join(root, "dest")
+		require.NoError(t, (&HelmChartHandler{}).Unpack(ctx, repo, desc, manifestBytes, dest))
+		testutil.AssertFileContent(t, filepath.Join(dest, "mychart-0.1.0.tgz"), "not-a-chart-archive")
+		entries, err := os.ReadDir(root)
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		assert.Equal(t, "dest", entries[0].Name())
+	})
+
+	t.Run("DestinationWithTrailingSeparator", func(t *testing.T) {
+		repo := testutil.NewFakeRepo()
+		desc, manifestBytes := buildHelmManifest(repo,
+			`{"apiVersion":"v2","name":"mychart","version":"0.1.0"}`,
+			[]byte("chart-data"),
+		)
+		root := t.TempDir()
+		dest := filepath.Join(root, "dest")
+		require.NoError(t, (&HelmChartHandler{}).Unpack(ctx, repo, desc, manifestBytes, dest+string(os.PathSeparator)))
+		testutil.AssertFileContent(t, filepath.Join(dest, "mychart-0.1.0.tgz"), "chart-data")
+		entries, err := os.ReadDir(root)
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		assert.Equal(t, "dest", entries[0].Name())
+	})
+
+	t.Run("MissingProvenanceDoesNotStageChart", func(t *testing.T) {
+		repo := testutil.NewFakeRepo()
+		desc, manifestBytes := buildHelmManifest(repo,
+			`{"apiVersion":"v2","name":"mychart","version":"0.1.0"}`,
+			[]byte("chart-data"),
+		)
+		root := t.TempDir()
+		dest := filepath.Join(root, "dest")
+		err := (&HelmChartHandler{Verify: downloader.VerifyAlways}).Unpack(ctx, repo, desc, manifestBytes, dest)
+		require.ErrorContains(t, err, "provenance data required")
+		assert.EqualValues(t, 1, repo.FetchBlobCount.Load(), "only the config blob should be fetched")
+		assertNoHelmOutput(t, root, dest)
+	})
+
+	t.Run("InvalidProvenanceRemovesStagedFiles", func(t *testing.T) {
+		repo := testutil.NewFakeRepo()
+		chartData, err := os.ReadFile("testdata/signtest-0.1.0.tgz")
+		require.NoError(t, err)
+		prov := repo.AddBlob([]byte("invalid-signature"), HelmProvenanceMediaType)
+		desc, manifestBytes := buildHelmManifest(repo,
+			`{"apiVersion":"v2","name":"signtest","version":"0.1.0"}`,
+			chartData, prov,
+		)
+		root := t.TempDir()
+		dest := filepath.Join(root, "dest")
+		err = (&HelmChartHandler{Verify: downloader.VerifyAlways, Keyring: "testdata/helm-test-key.pub"}).Unpack(ctx, repo, desc, manifestBytes, dest)
+		require.ErrorContains(t, err, "verifying chart provenance")
+		assertNoHelmOutput(t, root, dest)
+	})
+
+	t.Run("ChartReadOrCloseErrorRemovesStagedFiles", func(t *testing.T) {
+		readErr := errors.New("chart read failed")
+		closeErr := errors.New("chart close failed")
+		for _, tt := range []struct {
+			name     string
+			reader   io.Reader
+			closeErr error
+			wantErr  error
+		}{
+			{"read", iotest.ErrReader(readErr), nil, readErr},
+			{"close", strings.NewReader("chart-data"), closeErr, closeErr},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				repo := testutil.NewFakeRepo()
+				desc, manifestBytes := buildHelmManifest(repo,
+					`{"apiVersion":"v2","name":"mychart","version":"0.1.0"}`,
+					[]byte("chart-data"),
+				)
+				blob := &trackedHelmReader{Reader: tt.reader, closeErr: tt.closeErr}
+				repo.Blobs[digest.FromString("chart-data").String()] = func() io.ReadCloser { return blob }
+				root := t.TempDir()
+				dest := filepath.Join(root, "dest")
+				err := (&HelmChartHandler{}).Unpack(ctx, repo, desc, manifestBytes, dest)
+				require.ErrorIs(t, err, tt.wantErr)
+				assert.True(t, blob.closed)
+				assertNoHelmOutput(t, root, dest)
+			})
+		}
+	})
+
+	t.Run("ChartFetchErrorRemovesStagingDirectory", func(t *testing.T) {
+		repo := testutil.NewFakeRepo()
+		desc, manifestBytes := buildHelmManifest(repo,
+			`{"apiVersion":"v2","name":"mychart","version":"0.1.0"}`,
+			[]byte("chart-data"),
+		)
+		delete(repo.Blobs, digest.FromString("chart-data").String())
+		root := t.TempDir()
+		dest := filepath.Join(root, "dest")
+		err := (&HelmChartHandler{}).Unpack(ctx, repo, desc, manifestBytes, dest)
+		require.ErrorContains(t, err, "writing chart package")
+		assertNoHelmOutput(t, root, dest)
+	})
+
+	t.Run("ProvenanceFetchErrorRemovesStagedChart", func(t *testing.T) {
+		repo := testutil.NewFakeRepo()
+		prov := repo.AddBlob([]byte("provenance-data"), HelmProvenanceMediaType)
+		desc, manifestBytes := buildHelmManifest(repo,
+			`{"apiVersion":"v2","name":"mychart","version":"0.1.0"}`,
+			[]byte("chart-data"), prov,
+		)
+		delete(repo.Blobs, prov.Digest.String())
+		root := t.TempDir()
+		dest := filepath.Join(root, "dest")
+		err := (&HelmChartHandler{Verify: downloader.VerifyLater}).Unpack(ctx, repo, desc, manifestBytes, dest)
+		require.ErrorContains(t, err, "writing provenance file")
+		assertNoHelmOutput(t, root, dest)
+	})
+
+	t.Run("ProvenanceCloseErrorRemovesStagedFiles", func(t *testing.T) {
+		repo := testutil.NewFakeRepo()
+		prov := repo.AddBlob([]byte("provenance-data"), HelmProvenanceMediaType)
+		desc, manifestBytes := buildHelmManifest(repo,
+			`{"apiVersion":"v2","name":"mychart","version":"0.1.0"}`,
+			[]byte("chart-data"), prov,
+		)
+		closeErr := errors.New("provenance close failed")
+		blob := &trackedHelmReader{Reader: strings.NewReader("provenance-data"), closeErr: closeErr}
+		repo.Blobs[prov.Digest.String()] = func() io.ReadCloser { return blob }
+		root := t.TempDir()
+		dest := filepath.Join(root, "dest")
+		err := (&HelmChartHandler{Verify: downloader.VerifyLater}).Unpack(ctx, repo, desc, manifestBytes, dest)
+		require.ErrorIs(t, err, closeErr)
+		assert.True(t, blob.closed)
+		assertNoHelmOutput(t, root, dest)
+	})
+
+	t.Run("NonemptyDestinationIsNotReplaced", func(t *testing.T) {
+		repo := testutil.NewFakeRepo()
+		desc, manifestBytes := buildHelmManifest(repo,
+			`{"apiVersion":"v2","name":"mychart","version":"0.1.0"}`,
+			[]byte("chart-data"),
+		)
+		root := t.TempDir()
+		dest := filepath.Join(root, "dest")
+		require.NoError(t, os.Mkdir(dest, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(dest, "existing"), []byte("keep"), 0o600))
+		err := (&HelmChartHandler{}).Unpack(ctx, repo, desc, manifestBytes, dest)
+		require.ErrorContains(t, err, "renaming staged directory")
+		testutil.AssertFileContent(t, filepath.Join(dest, "existing"), "keep")
+		testutil.AssertFileNotExists(t, filepath.Join(dest, "mychart-0.1.0.tgz"))
+		entries, err := os.ReadDir(root)
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		assert.Equal(t, "dest", entries[0].Name())
+	})
+
+	t.Run("ExistingEmptyDestinationIsCleanOnError", func(t *testing.T) {
+		repo := testutil.NewFakeRepo()
+		desc, manifestBytes := buildHelmManifest(repo,
+			`{"apiVersion":"v2","name":"mychart","version":"0.1.0"}`,
+			[]byte("chart-data"),
+		)
+		root := t.TempDir()
+		dest := filepath.Join(root, "dest")
+		require.NoError(t, os.Mkdir(dest, 0o700))
+		err := (&HelmChartHandler{}).Unpack(ctx, repo, desc, manifestBytes, dest)
+		if err == nil {
+			testutil.AssertFileContent(t, filepath.Join(dest, "mychart-0.1.0.tgz"), "chart-data")
+		} else {
+			require.ErrorContains(t, err, "renaming staged directory")
+			entries, readErr := os.ReadDir(dest)
+			require.NoError(t, readErr)
+			assert.Empty(t, entries)
+		}
+		entries, readErr := os.ReadDir(root)
+		require.NoError(t, readErr)
+		require.Len(t, entries, 1)
+		assert.Equal(t, "dest", entries[0].Name())
 	})
 }

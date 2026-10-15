@@ -329,7 +329,7 @@ func TestFBCHandler_Unpack(t *testing.T) {
 		manifestBytes := testutil.BuildManifest(configDesc, layerDesc)
 		desc := repo.AddManifest(manifestBytes, ocispecv1.MediaTypeImageManifest)
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &FBCHandler{}
 		require.NoError(t, h.Unpack(ctx, repo, desc, manifestBytes, dest))
 
@@ -361,7 +361,7 @@ func TestFBCHandler_Unpack(t *testing.T) {
 		manifestBytes := testutil.BuildManifest(configDesc, layerDesc)
 		desc := repo.AddManifest(manifestBytes, ocispecv1.MediaTypeImageManifest)
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &FBCHandler{}
 		require.NoError(t, h.Unpack(ctx, repo, desc, manifestBytes, dest))
 
@@ -380,8 +380,9 @@ func TestFBCHandler_Unpack(t *testing.T) {
 		manifestBytes := testutil.BuildManifest(missingConfigDesc)
 		desc := repo.AddManifest(manifestBytes, ocispecv1.MediaTypeImageManifest)
 
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &FBCHandler{}
-		err := h.Unpack(ctx, repo, desc, manifestBytes, t.TempDir())
+		err := h.Unpack(ctx, repo, desc, manifestBytes, dest)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "fetching image config")
 	})
@@ -403,7 +404,8 @@ func TestFBCHandler_Unpack(t *testing.T) {
 				manifestBytes := testutil.BuildManifest(configDesc)
 				desc := repo.AddManifest(manifestBytes, ocispecv1.MediaTypeImageManifest)
 
-				err := (&FBCHandler{}).Unpack(ctx, repo, desc, manifestBytes, t.TempDir())
+				dest := filepath.Join(t.TempDir(), "dest")
+				err := (&FBCHandler{}).Unpack(ctx, repo, desc, manifestBytes, dest)
 				require.ErrorContains(t, err, "missing a non-empty")
 				assert.Contains(t, err.Error(), ConfigDirLabel)
 			})
@@ -427,8 +429,9 @@ func TestFBCHandler_Unpack(t *testing.T) {
 		manifestBytes := testutil.BuildManifest(configDesc, missingLayerDesc)
 		desc := repo.AddManifest(manifestBytes, ocispecv1.MediaTypeImageManifest)
 
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &FBCHandler{}
-		err := h.Unpack(ctx, repo, desc, manifestBytes, t.TempDir())
+		err := h.Unpack(ctx, repo, desc, manifestBytes, dest)
 		require.Error(t, err)
 	})
 
@@ -460,7 +463,7 @@ func TestFBCHandler_Unpack(t *testing.T) {
 			Size:      int64(len(indexBytes)),
 		}
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &FBCHandler{}
 		require.NoError(t, h.Unpack(ctx, repo, indexDesc, indexBytes, dest))
 
@@ -468,9 +471,10 @@ func TestFBCHandler_Unpack(t *testing.T) {
 	})
 
 	t.Run("Index/ResolutionFails", func(t *testing.T) {
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &FBCHandler{}
 		indexDesc := ocispecv1.Descriptor{MediaType: ocispecv1.MediaTypeImageIndex}
-		err := h.Unpack(ctx, testutil.NewFakeRepo(), indexDesc, []byte("not-json"), t.TempDir())
+		err := h.Unpack(ctx, testutil.NewFakeRepo(), indexDesc, []byte("not-json"), dest)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "resolving platform manifest")
 	})
@@ -500,7 +504,8 @@ func TestFBCHandler_UnpackRejectsSpecialEntries(t *testing.T) {
 				ConfigDirLabel: "/configs",
 			}, ocispecv1.MediaTypeImageManifest, layerDesc)
 
-			err = (&FBCHandler{}).Unpack(context.Background(), repo, desc, manifestBytes, t.TempDir())
+			dest := filepath.Join(t.TempDir(), "dest")
+			err = (&FBCHandler{}).Unpack(context.Background(), repo, desc, manifestBytes, dest)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 			} else {

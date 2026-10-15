@@ -566,3 +566,72 @@ func TestDiscoverManifestDescriptors(t *testing.T) {
 		assert.Equal(t, int32(1), inner.FetchBlobCount.Load(), "config should be fetched only once")
 	})
 }
+
+func TestFindFirstLayer(t *testing.T) {
+	layers := []ocispecv1.Descriptor{
+		{MediaType: "chart", Digest: digest.FromString("first")},
+		{MediaType: "other", Digest: digest.FromString("other")},
+		{MediaType: "chart", Digest: digest.FromString("second")},
+	}
+	tests := []struct {
+		name      string
+		layers    []ocispecv1.Descriptor
+		mediaType string
+		want      *ocispecv1.Descriptor
+	}{
+		{name: "FirstOfMultiple", layers: layers, mediaType: "chart", want: &layers[0]},
+		{name: "LaterMatch", layers: layers, mediaType: "other", want: &layers[1]},
+		{name: "NoMatch", layers: layers, mediaType: "missing", want: nil},
+		{name: "NoLayers", mediaType: "chart", want: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, FindFirstLayer(tt.layers, tt.mediaType))
+		})
+	}
+}
+
+func TestWriteBlobFile(t *testing.T) {
+	tests := []struct {
+		name          string
+		existing      string
+		missingBlob   bool
+		missingParent bool
+		wantContent   string
+		wantErr       string
+	}{
+		{name: "Create", wantContent: "new content"},
+		{name: "Replace", existing: "old content", wantContent: "new content"},
+		{name: "FetchFails", existing: "old content", missingBlob: true, wantContent: "old content", wantErr: "blob not found"},
+		{name: "CreateFails", missingParent: true, wantErr: "no such file or directory"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := testutil.NewFakeRepo()
+			desc := repo.AddBlob([]byte("new content"), "")
+			if tt.missingBlob {
+				desc.Digest = digest.FromString("missing")
+			}
+
+			path := filepath.Join(t.TempDir(), "blob")
+			if tt.missingParent {
+				path = filepath.Join(filepath.Dir(path), "missing", "blob")
+			}
+			if tt.existing != "" {
+				require.NoError(t, os.WriteFile(path, []byte(tt.existing), 0600))
+			}
+
+			err := WriteBlobFile(context.Background(), repo, desc, path)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			if tt.wantContent == "" {
+				require.NoFileExists(t, path)
+			} else {
+				testutil.AssertFileContent(t, path, tt.wantContent)
+			}
+		})
+	}
+}

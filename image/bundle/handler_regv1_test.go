@@ -177,7 +177,7 @@ func TestRegistryV1Handler_Unpack(t *testing.T) {
 			"other/should-not-be-present": "nope",
 		})
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &RegistryV1Handler{}
 		require.NoError(t, h.Unpack(ctx, repo, desc, manifestBytes, dest))
 
@@ -197,7 +197,7 @@ func TestRegistryV1Handler_Unpack(t *testing.T) {
 			"metadata/annotations.yaml": "annotations: {}",
 		})
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &RegistryV1Handler{}
 		require.NoError(t, h.Unpack(ctx, repo, desc, manifestBytes, dest))
 
@@ -217,7 +217,7 @@ func TestRegistryV1Handler_Unpack(t *testing.T) {
 			"metadata/annotations.yaml":        "default annotations",
 		})
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &RegistryV1Handler{}
 		require.NoError(t, h.Unpack(ctx, repo, desc, manifestBytes, dest))
 
@@ -239,7 +239,7 @@ func TestRegistryV1Handler_Unpack(t *testing.T) {
 			"metadata/annotations.yaml":    "default annotations",
 		})
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &RegistryV1Handler{}
 		require.NoError(t, h.Unpack(ctx, repo, desc, manifestBytes, dest))
 
@@ -257,7 +257,7 @@ func TestRegistryV1Handler_Unpack(t *testing.T) {
 			"manifests/csv.yaml": "content",
 		})
 
-		dest := t.TempDir()
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &RegistryV1Handler{}
 		require.NoError(t, h.Unpack(ctx, repo, desc, manifestBytes, dest))
 
@@ -276,8 +276,9 @@ func TestRegistryV1Handler_Unpack(t *testing.T) {
 		manifestBytes := testutil.BuildManifest(missingConfigDesc)
 		desc := repo.AddManifest(manifestBytes, ocispecv1.MediaTypeImageManifest)
 
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &RegistryV1Handler{}
-		err := h.Unpack(ctx, repo, desc, manifestBytes, t.TempDir())
+		err := h.Unpack(ctx, repo, desc, manifestBytes, dest)
 		require.Error(t, err)
 	})
 
@@ -297,8 +298,9 @@ func TestRegistryV1Handler_Unpack(t *testing.T) {
 		manifestBytes := testutil.BuildManifest(configDesc, missingLayerDesc)
 		desc := repo.AddManifest(manifestBytes, ocispecv1.MediaTypeImageManifest)
 
+		dest := filepath.Join(t.TempDir(), "dest")
 		h := &RegistryV1Handler{}
-		err := h.Unpack(ctx, repo, desc, manifestBytes, t.TempDir())
+		err := h.Unpack(ctx, repo, desc, manifestBytes, dest)
 		require.Error(t, err)
 	})
 }
@@ -327,7 +329,8 @@ func TestRegistryV1Handler_UnpackRejectsSpecialEntries(t *testing.T) {
 				BundleMediaTypeLabel: BundleMediaTypeRegistryV1,
 			}, ocispecv1.MediaTypeImageManifest, layerDesc)
 
-			err = (&RegistryV1Handler{}).Unpack(context.Background(), repo, desc, manifestBytes, t.TempDir())
+			dest := filepath.Join(t.TempDir(), "dest")
+			err = (&RegistryV1Handler{}).Unpack(context.Background(), repo, desc, manifestBytes, dest)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 			} else {

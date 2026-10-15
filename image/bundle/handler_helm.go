@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 
 	ocispecv1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/operator-framework/library-olm/image"
 	"github.com/operator-framework/library-olm/image/internal/ociutil"
+	"github.com/operator-framework/library-olm/image/internal/osutil"
 )
 
 // Helm OCI artifact media types as defined by the Helm specification.
@@ -33,7 +33,8 @@ const (
 // HelmChartHandler is an [image.Handler] that unpacks Helm chart OCI artifacts.
 // It matches OCI manifests whose config descriptor has media type
 // [HelmConfigMediaType], then writes the chart package and optional provenance
-// file into the destination directory.
+// file into the destination directory. It does not parse or validate the chart
+// archive; callers can do that after unpacking.
 //
 // This produces the inverse of what `helm push` stores:
 //   - <name>-<version>.tgz      — the chart package (always written)
@@ -74,65 +75,80 @@ func (h *HelmChartHandler) Discover(ctx context.Context, repo image.Repository, 
 	return ociutil.DiscoverManifestDescriptors(ctx, repo, desc, manifestBytes)
 }
 
+// Unpack stages the selected layers beside dest and publishes them together by
+// renaming the staging directory. The parent of dest must exist. Replacing an
+// existing empty dest directory depends on the platform's rename behavior;
+// a nonempty dest directory is never replaced.
 func (h *HelmChartHandler) Unpack(ctx context.Context, repo image.Repository, _ ocispecv1.Descriptor, manifestBytes []byte, dest string) error {
+	plan, err := h.planUnpack(ctx, repo, manifestBytes)
+	if err != nil {
+		return err
+	}
+	return osutil.DoStagedDir(dest, func(stagedDir string) error {
+		return h.doUnpack(ctx, repo, plan, stagedDir)
+	})
+}
+
+type helmUnpackPlan struct {
+	basename         string
+	chartLayer       ocispecv1.Descriptor
+	provenanceLayer  *ocispecv1.Descriptor
+	verifyProvenance bool
+}
+
+func (h *HelmChartHandler) planUnpack(ctx context.Context, repo image.Repository, manifestBytes []byte) (helmUnpackPlan, error) {
 	var m ocispecv1.Manifest
 	if err := json.Unmarshal(manifestBytes, &m); err != nil {
-		return fmt.Errorf("parsing manifest: %w", err)
+		return helmUnpackPlan{}, fmt.Errorf("parsing manifest: %w", err)
 	}
 
-	cfg, err := fetchHelmConfig(ctx, repo, m.Config)
+	cfg, err := h.fetchHelmConfig(ctx, repo, m.Config)
 	if err != nil {
-		return err
+		return helmUnpackPlan{}, err
 	}
 
-	chartLayer, err := findLayer(m.Layers, HelmChartContentMediaType)
-	if err != nil {
-		return err
+	chartLayer := ociutil.FindFirstLayer(m.Layers, HelmChartContentMediaType)
+	if chartLayer == nil {
+		return helmUnpackPlan{}, fmt.Errorf("layer with media type %s not found", HelmChartContentMediaType)
 	}
 
-	basename := fmt.Sprintf("%s-%s", cfg.Name, cfg.Version)
-	tgzPath := filepath.Join(dest, basename+".tgz")
-
-	if err := writeBlob(ctx, repo, chartLayer, tgzPath); err != nil {
-		return fmt.Errorf("writing chart package: %w", err)
+	plan := helmUnpackPlan{
+		basename:   fmt.Sprintf("%s-%s", cfg.Name, cfg.Version),
+		chartLayer: *chartLayer,
 	}
-
-	provLayer, hasProv := tryFindLayer(m.Layers, HelmProvenanceMediaType)
-
+	provLayer := ociutil.FindFirstLayer(m.Layers, HelmProvenanceMediaType)
 	switch {
 	case h.Verify == downloader.VerifyNever:
 		// No provenance handling.
-	case !hasProv && h.Verify == downloader.VerifyIfPossible:
+	case provLayer == nil && h.Verify == downloader.VerifyIfPossible:
 		// No provenance available, not required.
-	case !hasProv:
+	case provLayer == nil:
 		// VerifyAlways or VerifyLater both require the provenance layer.
-		return fmt.Errorf("provenance data required but no provenance layer found")
+		return helmUnpackPlan{}, fmt.Errorf("provenance data required but no provenance layer found")
 	default:
-		// Write the provenance file.
-		provPath := filepath.Join(dest, basename+".tgz.prov")
-		if err := writeBlob(ctx, repo, provLayer, provPath); err != nil {
-			return fmt.Errorf("writing provenance file: %w", err)
-		}
-		// Verify unless deferred.
-		if h.Verify != downloader.VerifyLater {
-			if _, err := downloader.VerifyChart(tgzPath, provPath, h.Keyring); err != nil {
-				return fmt.Errorf("verifying chart provenance: %w", err)
-			}
-		}
+		plan.provenanceLayer = provLayer
+		plan.verifyProvenance = h.Verify != downloader.VerifyLater
 	}
-
-	return nil
+	return plan, nil
 }
 
-func fetchHelmConfig(ctx context.Context, repo image.Repository, desc ocispecv1.Descriptor) (*chart.Metadata, error) {
+func (h *HelmChartHandler) fetchHelmConfig(ctx context.Context, repo image.Repository, desc ocispecv1.Descriptor) (*chart.Metadata, error) {
 	reader, err := repo.FetchBlob(ctx, desc)
 	if err != nil {
 		return nil, fmt.Errorf("fetching helm config: %w", err)
 	}
 
+	configBlob, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("reading helm config: %w", err), reader.Close())
+	}
+
+	if err := reader.Close(); err != nil {
+		return nil, fmt.Errorf("closing helm config: %w", err)
+	}
+
 	var cfg chart.Metadata
-	decodeErr := json.NewDecoder(reader).Decode(&cfg)
-	if err := errors.Join(decodeErr, reader.Close()); err != nil {
+	if err := json.Unmarshal(configBlob, &cfg); err != nil {
 		return nil, fmt.Errorf("reading helm config: %w", err)
 	}
 	if err := cfg.Validate(); err != nil {
@@ -141,34 +157,23 @@ func fetchHelmConfig(ctx context.Context, repo image.Repository, desc ocispecv1.
 	return &cfg, nil
 }
 
-func writeBlob(ctx context.Context, repo image.Repository, desc ocispecv1.Descriptor, path string) error {
-	reader, err := repo.FetchBlob(ctx, desc)
-	if err != nil {
-		return err
+func (h *HelmChartHandler) doUnpack(ctx context.Context, repo image.Repository, plan helmUnpackPlan, dest string) error {
+	chartPath := filepath.Join(dest, plan.basename+".tgz")
+	if err := ociutil.WriteBlobFile(ctx, repo, plan.chartLayer, chartPath); err != nil {
+		return fmt.Errorf("writing chart package: %w", err)
 	}
-
-	data, readErr := io.ReadAll(reader)
-	if err := errors.Join(readErr, reader.Close()); err != nil {
-		return err
+	if plan.provenanceLayer == nil {
+		return nil
 	}
-	return os.WriteFile(path, data, 0o600)
-}
-
-// findLayer returns the first layer descriptor with the given media type.
-func findLayer(layers []ocispecv1.Descriptor, mediaType string) (ocispecv1.Descriptor, error) {
-	desc, found := tryFindLayer(layers, mediaType)
-	if !found {
-		return ocispecv1.Descriptor{}, fmt.Errorf("no layer with media type %q found", mediaType)
+	provPath := chartPath + ".prov"
+	if err := ociutil.WriteBlobFile(ctx, repo, *plan.provenanceLayer, provPath); err != nil {
+		return fmt.Errorf("writing provenance file: %w", err)
 	}
-	return desc, nil
-}
-
-// tryFindLayer returns the first layer descriptor with the given media type, if any.
-func tryFindLayer(layers []ocispecv1.Descriptor, mediaType string) (ocispecv1.Descriptor, bool) {
-	for _, l := range layers {
-		if l.MediaType == mediaType {
-			return l, true
-		}
+	if !plan.verifyProvenance {
+		return nil
 	}
-	return ocispecv1.Descriptor{}, false
+	if _, err := downloader.VerifyChart(chartPath, provPath, h.Keyring); err != nil {
+		return fmt.Errorf("verifying chart provenance: %w", err)
+	}
+	return nil
 }

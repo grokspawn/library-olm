@@ -8,6 +8,7 @@ import (
 
 	"github.com/operator-framework/library-olm/image"
 	"github.com/operator-framework/library-olm/image/internal/ociutil"
+	"github.com/operator-framework/library-olm/image/internal/osutil"
 )
 
 // Bundle label keys used to identify and configure registry+v1 bundles.
@@ -74,5 +75,7 @@ func (h *RegistryV1Handler) Unpack(ctx context.Context, repo image.Repository, _
 		ociutil.RequireRegularFilesOrDirectories(),
 		ociutil.AsCurrentUser(),
 	)
-	return ociutil.ApplyLayers(ctx, repo, manifestBytes, dest, filter)
+	return osutil.DoStagedDir(dest, func(stagedDir string) error {
+		return ociutil.ApplyLayers(ctx, repo, manifestBytes, stagedDir, filter)
+	})
 }

@@ -33,12 +33,13 @@ func ExampleRegistryV1Handler() {
 		imgbundle.BundleMediaTypeLabel: imgbundle.BundleMediaTypeRegistryV1,
 	}, ocispecv1.MediaTypeImageManifest, layerDesc)
 
-	dest, err := os.MkdirTemp("", "example-regv1-*")
+	parent, err := os.MkdirTemp("", "example-regv1-*")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer func() { _ = os.RemoveAll(dest) }()
+	defer func() { _ = os.RemoveAll(parent) }()
 
+	dest := filepath.Join(parent, "bundle")
 	handler := &imgbundle.RegistryV1Handler{}
 	if err := handler.Unpack(context.Background(), repo, desc, manifestBytes, dest); err != nil {
 		log.Fatal(err)
@@ -64,12 +65,13 @@ func ExampleHelmChartHandler() {
 	manifestBytes := testutil.BuildManifest(configDesc, chartDesc)
 	desc := repo.AddManifest(manifestBytes, ocispecv1.MediaTypeImageManifest)
 
-	dest, err := os.MkdirTemp("", "example-helm-*")
+	parent, err := os.MkdirTemp("", "example-helm-*")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer func() { _ = os.RemoveAll(dest) }()
+	defer func() { _ = os.RemoveAll(parent) }()
 
+	dest := filepath.Join(parent, "chart")
 	handler := &imgbundle.HelmChartHandler{}
 	if err := handler.Unpack(context.Background(), repo, desc, manifestBytes, dest); err != nil {
 		log.Fatal(err)
@@ -100,12 +102,13 @@ func ExampleFBCHandler() {
 		imgcatalog.ConfigDirLabel: "/configs",
 	}, ocispecv1.MediaTypeImageManifest, layerDesc)
 
-	dest, err := os.MkdirTemp("", "example-fbc-*")
+	parent, err := os.MkdirTemp("", "example-fbc-*")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer func() { _ = os.RemoveAll(dest) }()
+	defer func() { _ = os.RemoveAll(parent) }()
 
+	dest := filepath.Join(parent, "fbc")
 	handler := &imgcatalog.FBCHandler{}
 	if err := handler.Unpack(context.Background(), repo, desc, manifestBytes, dest); err != nil {
 		log.Fatal(err)

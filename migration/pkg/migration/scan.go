@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
@@ -354,7 +358,7 @@ func EligibleFromScan(results []OperatorScanResult) []OperatorScanResult {
 	return eligible
 }
 
-// RollbackClusterExtension deletes the CE and COS (orphan cascade), then restores the Subscription.
+// RollbackClusterExtension releases OLMv1 management and restores the Subscription.
 func (m *Migrator) RollbackClusterExtension(ctx context.Context, ceName string, acknowledgeInstalled bool) error {
 	var ce ocv1.ClusterExtension
 	if err := m.Client.Get(ctx, client.ObjectKey{Name: ceName}, &ce); err != nil {
@@ -396,9 +400,27 @@ func (m *Migrator) RollbackClusterExtension(ctx context.Context, ceName string, 
 	if err := m.Client.Get(ctx, client.ObjectKey{Name: ns}, &sourceNamespace); err != nil {
 		return fmt.Errorf("source namespace %q must exist before rollback can restore Subscription: %w", ns, err)
 	}
+	var existingSub operatorsv1alpha1.Subscription
+	subKey := client.ObjectKey{Name: name, Namespace: ns}
+	if err := m.Client.Get(ctx, subKey, &existingSub); err == nil {
+		if existingSub.DeletionTimestamp != nil || existingSub.Spec == nil || !apiequality.Semantic.DeepEqual(*existingSub.Spec, subSpec) {
+			return fmt.Errorf("existing Subscription %s/%s does not match migration backup", ns, name)
+		}
+	} else if client.IgnoreNotFound(err) != nil {
+		return fmt.Errorf("checking existing Subscription %s/%s before rollback: %w", ns, name, err)
+	}
 
-	// Snapshot every revision before deleting the extension. The controller
-	// creates catalog revisions after the initial migration revision, and orphan
+	m.progress(ProgressEvent{Step: ProgressStepRollback, Status: ProgressStarted, Message: fmt.Sprintf("Rolling back ClusterExtension %s", ceName)})
+
+	// Stop further operator-controller reconciliation before collecting the
+	// authoritative revision list. The finalizer keeps the backup available
+	// if resource release fails and rollback is retried.
+	if err := m.beginRollbackDeletion(ctx, &ce); err != nil {
+		return err
+	}
+
+	// Snapshot every revision after CE deletion starts. The controller creates
+	// catalog revisions after the initial migration revision, and orphan
 	// propagation leaves those revisions alive unless rollback removes them too.
 	var revisions ocv1.ClusterObjectSetList
 	if err := m.Client.List(ctx, &revisions, client.MatchingLabels{LabelOwnerName: ceName}); err != nil {
@@ -424,32 +446,58 @@ func (m *Migrator) RollbackClusterExtension(ctx context.Context, ceName string, 
 		}
 		revisions.Items = append(revisions.Items, cos)
 	}
+	ownedObjects, err := m.saveRollbackSnapshot(ctx, &ce, revisions.Items)
+	if err != nil {
+		return err
+	}
 
-	// Delete revisions before the CE so a failed revision deletion leaves the
-	// authoritative Subscription backup available for a later rollback attempt.
+	// Delete the snapshotted revisions by UID. A reconciliation already in
+	// flight can replace one with the same name; the wait below snapshots and
+	// removes that replacement without deleting it under the old UID.
 	for i := range revisions.Items {
-		if err := m.Client.Delete(ctx, &revisions.Items[i], client.PropagationPolicy("Orphan")); err != nil {
-			if client.IgnoreNotFound(err) != nil {
-				return fmt.Errorf("failed to delete ClusterObjectSet %s: %w", revisions.Items[i].Name, err)
-			}
+		if err := m.deleteTrackedResource(ctx, &revisions.Items[i], client.PropagationPolicy("Orphan")); err != nil &&
+			!apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			return fmt.Errorf("failed to delete ClusterObjectSet %s: %w", revisions.Items[i].Name, err)
 		}
 	}
-
-	// Delete CE (orphan cascade — preserves operator workloads).
-	if err := m.Client.Delete(ctx, &ce, client.PropagationPolicy("Orphan")); err != nil {
-		if client.IgnoreNotFound(err) != nil {
-			return fmt.Errorf("failed to delete ClusterExtension: %w", err)
-		}
+	m.progress(ProgressEvent{Step: ProgressStepRollback, Status: ProgressWaiting, Message: "Waiting for ClusterObjectSet revisions to be removed (up to 2 minutes)..."})
+	if err := m.waitForRollbackRevisionsRemoved(ctx, &ce, &ownedObjects); err != nil {
+		return err
+	}
+	m.progress(ProgressEvent{Step: ProgressStepRollback, Status: ProgressWaiting, Message: "Waiting for orphaned workloads and releasing ownership metadata (up to 2 minutes per resource)..."})
+	if err := m.releaseRevisionObjects(ctx, ownedObjects); err != nil {
+		return fmt.Errorf("failed to release orphaned ClusterObjectSet resources: %w", err)
 	}
 
-	// Restore Subscription from the validated backup.
+	// Restore while the finalizer still protects the backup. A retry may find a
+	// Subscription created by a prior attempt; accept it only if it matches.
 	restoredSub := &operatorsv1alpha1.Subscription{}
 	restoredSub.Name = name
 	restoredSub.Namespace = ns
 	restoredSub.Spec = &subSpec
-
 	if err := m.Client.Create(ctx, restoredSub); err != nil {
-		return fmt.Errorf("failed to restore Subscription %s/%s: %w", ns, name, err)
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to restore Subscription %s/%s: %w", ns, name, err)
+		}
+		var current operatorsv1alpha1.Subscription
+		if err := m.Client.Get(ctx, subKey, &current); err != nil {
+			return fmt.Errorf("checking restored Subscription %s/%s: %w", ns, name, err)
+		}
+		if current.DeletionTimestamp != nil || current.Spec == nil || !apiequality.Semantic.DeepEqual(*current.Spec, subSpec) {
+			return fmt.Errorf("existing Subscription %s/%s does not match migration backup", ns, name)
+		}
+	}
+
+	if err := m.finishRollbackDeletion(ctx, ceName); err != nil {
+		return err
+	}
+	m.progress(ProgressEvent{Step: ProgressStepRollback, Status: ProgressWaiting, Message: "Waiting for ClusterExtension deletion (up to 2 minutes)..."})
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		var current ocv1.ClusterExtension
+		err := m.Client.Get(ctx, client.ObjectKey{Name: ceName}, &current)
+		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	}); err != nil {
+		return fmt.Errorf("waiting for ClusterExtension %s deletion: %w", ceName, err)
 	}
 
 	m.progress(ProgressEvent{Step: ProgressStepRollback, Status: ProgressCompleted, Message: fmt.Sprintf("Subscription %s/%s restored; operator returning to OLMv0 management", ns, name)})
